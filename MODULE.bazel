@@ -223,14 +223,23 @@ deb_data(
     data = "@qemu_user_arm64//:data.tar.xz",
 )
 
-# Root certificates.
+# Root and CA certificates.
 #
-# Note that the sha256 hash is omitted here intentionally. This should not be
+# Note that the sha256 hash is omitted here intentionally. These should not be
 # used in any part of the build other than as certificates present in images.
+
 http_file(
     name = "google_root_pem",
     urls = [
         "https://pki.goog/roots.pem",
+    ],
+)
+
+http_file(
+    name = "mozilla_root_pem",
+    downloaded_file_path = "ca-certificates.crt",
+    urls = [
+        "https://curl.se/ca/cacert.pem",
     ],
 )
 
