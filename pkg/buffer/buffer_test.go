@@ -638,6 +638,63 @@ func TestBufferPullUp(t *testing.T) {
 	}
 }
 
+type limitedReaderError struct {
+	err error
+}
+
+func (r limitedReaderError) Read([]byte) (int, error) {
+	return 0, r.err
+}
+
+func TestWriteFromReaderAndLimitedReaderReleasesReader(t *testing.T) {
+	readErr := fmt.Errorf("reader failed")
+	for _, tc := range []struct {
+		name    string
+		data    []byte
+		count   int64
+		wantErr error
+	}{
+		{
+			name:  "exact count",
+			data:  []byte("payload"),
+			count: 7,
+		},
+		{
+			name:  "multiple chunks",
+			data:  bytes.Repeat([]byte{0x5a}, MaxChunkSize+17),
+			count: MaxChunkSize + 17,
+		},
+		{
+			name:    "partial read error",
+			data:    []byte("partial"),
+			count:   20,
+			wantErr: readErr,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var reader io.Reader = bytes.NewReader(tc.data)
+			if tc.wantErr != nil {
+				reader = io.MultiReader(reader, limitedReaderError{tc.wantErr})
+			}
+			const prefix = "prefix:"
+			b := MakeWithData([]byte(prefix))
+			defer b.Release()
+			var lr io.LimitedReader
+			n, err := b.WriteFromReaderAndLimitedReader(reader, tc.count, &lr)
+			if n != int64(len(tc.data)) || err != tc.wantErr {
+				t.Errorf("WriteFromReaderAndLimitedReader = (%d, %v), want (%d, %v)", n, err, len(tc.data), tc.wantErr)
+			}
+			want := append([]byte(prefix), tc.data...)
+			if got := b.Flatten(); !bytes.Equal(got, want) {
+				t.Errorf("buffer contents differ: got %d bytes, want %d", len(got), len(want))
+			}
+			if lr.R != nil {
+				t.Error("LimitedReader retains the reader after the copy returns")
+			}
+		})
+	}
+}
+
 func TestReadFromLargeWriter(t *testing.T) {
 	writeSize := int64(1 << 20)
 	largeWriter := bytes.NewBuffer(make([]byte, writeSize))
