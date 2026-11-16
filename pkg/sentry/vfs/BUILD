@@ -212,6 +212,7 @@ go_test(
     name = "vfs_test",
     size = "small",
     srcs = [
+        "copy_test.go",
         "dentry_test.go",
         "device_test.go",
         "epoll_test.go",
