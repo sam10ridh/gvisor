@@ -37,6 +37,7 @@
 #include <sys/un.h>
 #include <sys/vfs.h>
 #include <sys/wait.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -2996,6 +2997,67 @@ TEST(MountTest, DetachedMountBindFails) {
 
   EXPECT_THAT(mount(fd_path.c_str(), path2.path().c_str(), "", MS_BIND, 0),
               SyscallFailsWithErrno(EINVAL));
+}
+
+TEST(MountTest, OverlayfsChmodPreservesCopiedData) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  auto base = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto tmpfs_mount = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("tmpfs", base.path(), "tmpfs", 0, "", MNT_DETACH));
+  auto lower = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(base.path()));
+  auto upper = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(base.path()));
+  auto work = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(base.path()));
+  auto merged = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(base.path()));
+
+  SKIP_IF(removexattr(upper.path().c_str(), "user.overlay.opaque") < 0 &&
+          errno == EOPNOTSUPP);
+
+  std::string long_contents(70 * 1024 + 17, '\0');
+  for (size_t i = 0; i < long_contents.size(); ++i) {
+    long_contents[i] = static_cast<char>(i % 251);
+  }
+  const std::vector<std::string> contents = {long_contents, "short", ""};
+  for (size_t i = 0; i < contents.size(); ++i) {
+    const std::string path = JoinPath(lower.path(), absl::StrCat(i));
+    ASSERT_NO_ERRNO(CreateWithContents(path, contents[i], 0644));
+    ASSERT_THAT(chmod(path.c_str(), 0644), SyscallSucceeds());
+  }
+
+  // userxattr disables metacopy, so metadata changes also copy file data.
+  auto overlay_mount = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("overlay", merged.path(), "overlay", 0,
+            absl::StrCat("lowerdir=", lower.path(), ",upperdir=", upper.path(),
+                         ",workdir=", work.path(), ",userxattr"),
+            MNT_DETACH));
+
+  for (size_t i = 0; i < contents.size(); ++i) {
+    SCOPED_TRACE(i);
+    const std::string name = absl::StrCat(i);
+    const std::string lower_path = JoinPath(lower.path(), name);
+    const std::string upper_path = JoinPath(upper.path(), name);
+    const std::string merged_path = JoinPath(merged.path(), name);
+    const struct stat before = ASSERT_NO_ERRNO_AND_VALUE(Stat(lower_path));
+    struct stat st;
+    ASSERT_THAT(stat(upper_path.c_str(), &st), SyscallFailsWithErrno(ENOENT));
+
+    // Change metadata without opening the file for writing or truncating it.
+    ASSERT_THAT(chmod(merged_path.c_str(), 0600), SyscallSucceeds());
+
+    for (const auto& path : {merged_path, upper_path, lower_path}) {
+      SCOPED_TRACE(path);
+      std::string actual;
+      ASSERT_NO_ERRNO(GetContents(path, &actual));
+      EXPECT_EQ(actual, contents[i]);
+      ASSERT_THAT(stat(path.c_str(), &st), SyscallSucceeds());
+      EXPECT_TRUE(S_ISREG(st.st_mode));
+      EXPECT_EQ(st.st_size, contents[i].size());
+      EXPECT_EQ(st.st_uid, before.st_uid);
+      EXPECT_EQ(st.st_gid, before.st_gid);
+      EXPECT_EQ(st.st_mode & 07777,
+                path == lower_path ? before.st_mode & 07777 : 0600);
+    }
+  }
 }
 
 TEST(MountTest, MountProc) {
