@@ -459,6 +459,11 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 							stackMaskAR.End = newEnd
 						}
 						copyAR = pseg.Range().Intersect(stackMaskAR)
+					} else if vma.mappable != nil {
+						// The dynamic loader writes library data a few pages at
+						// a time, so copy a small block unless earlier copies
+						// look sequential.
+						copyAR = pseg.Range().Intersect(fileCopyAR(vseg, pseg, ar, hugeMaskAR))
 					} else {
 						// Hugepage-align the range to be copied, for the same
 						// reasons as for private anonymous allocations.
@@ -624,6 +629,43 @@ func hugepageAligned(ar hostarch.AddrRange) hostarch.AddrRange {
 		}
 	}
 	return aligned
+}
+
+const (
+	// fileCopySize is the alignment of copies made when breaking copy-on-write
+	// in private file mappings.
+	fileCopySize = 64 << 10
+
+	// fileCopyRunSize is the length of private pmas immediately before a
+	// faulting pma at which its copy extends to the end of the huge page.
+	fileCopyRunSize = 4 * fileCopySize
+)
+
+// fileCopyAR returns the range to copy when breaking copy-on-write at ar in
+// pseg, a pma in the private file mapping vseg. hugeMaskAR is ar aligned to
+// huge pages.
+func fileCopyAR(vseg vmaIterator, pseg pmaIterator, ar, hugeMaskAR hostarch.AddrRange) hostarch.AddrRange {
+	copyAR := hostarch.AddrRange{ar.Start &^ (fileCopySize - 1), ar.End}
+	if end := ar.End + fileCopySize - 1; end >= ar.End {
+		copyAR.End = end &^ (fileCopySize - 1)
+	}
+	if copyAR.Start > pseg.Start() {
+		// Part of pseg before ar is still uncopied.
+		return copyAR
+	}
+	// Sum the contiguous private pmas before pseg, since earlier copies may
+	// not merge.
+	var n hostarch.Addr
+	for prev := pseg.PrevSegment(); n < fileCopyRunSize && prev.Ok() && prev.End() == pseg.Start()-n; prev = prev.PrevSegment() {
+		if prev.Start() < vseg.Start() || !prev.ValuePtr().private || prev.ValuePtr().needCOW {
+			break
+		}
+		n += prev.Range().Length()
+	}
+	if n >= fileCopyRunSize && hugeMaskAR.End > copyAR.End {
+		copyAR.End = hugeMaskAR.End
+	}
+	return copyAR
 }
 
 // isPMACopyOnWriteLocked returns true if the contents of the pma represented

@@ -1383,3 +1383,48 @@ func TestGetByteSlicePtrZeroed(t *testing.T) {
 		putByteSlicePtr(s)
 	}
 }
+
+// TestFileCopyOnWriteCopiesSmallRange tests that private file mappings copy
+// 64 KiB per write fault until 256 KiB of earlier copies precede the fault.
+func TestFileCopyOnWriteCopiesSmallRange(t *testing.T) {
+	ctx := contexttest.Context(t)
+	mm := testMemoryManager(ctx, t)
+	defer mm.DecUsers(ctx)
+
+	mf := pgalloc.MemoryFileFromContext(ctx)
+	fr, err := mf.Allocate(2*hostarch.HugePageSize, pgalloc.AllocOpts{})
+	if err != nil {
+		t.Fatalf("failed to allocate memory file range: %v", err)
+	}
+	mappable := NewSpecialMappable("test_mappable", mf, fr)
+	defer mappable.DecRef(ctx)
+	addr, err := mm.MMap(ctx, memmap.MMapOpts{
+		Length:          2 * hostarch.HugePageSize,
+		MappingIdentity: mappable,
+		Mappable:        mappable,
+		Private:         true,
+		Perms:           hostarch.ReadWrite,
+		MaxPerms:        hostarch.AnyAccess,
+	})
+	if err != nil {
+		t.Fatalf("MMap got err %v want nil", err)
+	}
+	base := addr.MustHugeRoundUp()
+	const small = 64 << 10
+	for i := 0; i <= 4; i++ {
+		fault := base + hostarch.Addr(i)*small
+		if err := mm.HandleUserFault(ctx, fault, hostarch.Write, 0); err != nil {
+			t.Fatalf("HandleUserFault(%#x) got err %v want nil", fault, err)
+		}
+		mm.activeMu.RLock()
+		copied := mm.pmas.FindSegment(fault).Range()
+		mm.activeMu.RUnlock()
+		wantEnd := fault + small
+		if i == 4 {
+			wantEnd = base + hostarch.HugePageSize
+		}
+		if copied.End != wantEnd {
+			t.Errorf("write fault at %#x copied up to %#x, want %#x", fault, copied.End, wantEnd)
+		}
+	}
+}
